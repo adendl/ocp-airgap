@@ -1,0 +1,133 @@
+---
+# =============================================================================
+#  teardown-openshift-lab.yml
+#
+#  Cleanly removes everything bootstrap-openshift-lab.yml created:
+#    * the 3 master VMs + the bastion VM (and their disks)
+#    * the agent ISO, cloud-init seed, and cloud image
+#    * the isolated ocp-airgap libvirt network
+#    * the Quay CA from the host trust store
+#    * (optional) the /usr/local/bin binaries and the ~/ocp-lab working dir
+#
+#  The libvirt 'default' NAT network is left untouched (it predates the lab).
+#
+#  RUN:
+#    ansible-playbook teardown-openshift-lab.yml --ask-become-pass
+#
+#  Keep binaries and the workdir (default is to remove them):
+#    ansible-playbook teardown-openshift-lab.yml --ask-become-pass \
+#      -e remove_binaries=false -e remove_workdir=false
+# =============================================================================
+
+- name: "Tear down the disconnected OpenShift lab"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: true
+
+  vars:
+    airgap_net: ocp-airgap
+    images_dir: /var/lib/libvirt/images
+    home_dir: "{{ lookup('env', 'HOME') }}"
+    workdir: "{{ lookup('env', 'HOME') }}/ocp-lab"
+    ssh_key: "{{ lookup('env', 'HOME') }}/.ssh/ocp"
+    vm_names: [master0, master1, master2, bastion]
+    disk_files:
+      - master0.qcow2
+      - master1.qcow2
+      - master2.qcow2
+      - bastion.qcow2
+      - bastion-base.qcow2
+      - agent.iso
+      - seed.iso
+      - user-data
+      - meta-data
+      - network-config
+    installed_binaries: [oc, kubectl, oc-mirror, openshift-install]
+    # --- toggles (override with -e) ---
+    remove_binaries: true
+    remove_workdir: true
+    remove_ssh_key: false     # keep the lab SSH key by default
+
+  tasks:
+    - name: VMs | destroy (power off) if running
+      ansible.builtin.command: "virsh destroy {{ item }}"
+      loop: "{{ vm_names }}"
+      register: destroy
+      changed_when: "'destroyed' in destroy.stdout | default('')"
+      failed_when: false
+
+    - name: VMs | undefine (remove definition, storage, nvram, snapshots)
+      ansible.builtin.command: >
+        virsh undefine {{ item }}
+        --remove-all-storage --nvram --snapshots-metadata
+      loop: "{{ vm_names }}"
+      register: undefine
+      changed_when: "'undefined' in undefine.stdout | default('')"
+      failed_when: false
+
+    - name: Disks | remove any leftover image files
+      ansible.builtin.file:
+        path: "{{ images_dir }}/{{ item }}"
+        state: absent
+      loop: "{{ disk_files }}"
+
+    - name: Network | destroy + undefine ocp-airgap
+      ansible.builtin.shell: |
+        virsh net-destroy {{ airgap_net }} 2>/dev/null
+        virsh net-undefine {{ airgap_net }} 2>/dev/null
+        true
+      changed_when: false
+
+    - name: Trust | remove Quay CA from host anchors
+      ansible.builtin.file:
+        path: /etc/pki/ca-trust/source/anchors/quay-bastion.pem
+        state: absent
+      notify: update ca trust
+
+    - name: Hosts | remove bastion /etc/hosts entry
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "bastion\\.lab\\.example\\.com"
+        state: absent
+
+    - name: Binaries | remove from /usr/local/bin
+      when: remove_binaries | bool
+      ansible.builtin.file:
+        path: "/usr/local/bin/{{ item }}"
+        state: absent
+      loop: "{{ installed_binaries }}"
+
+    - name: Workdir | remove ~/ocp-lab
+      when: remove_workdir | bool
+      ansible.builtin.file:
+        path: "{{ workdir }}"
+        state: absent
+
+    - name: SSH | remove lab keypair
+      when: remove_ssh_key | bool
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ ssh_key }}"
+        - "{{ ssh_key }}.pub"
+
+    - name: Podman | drop Quay login (best effort)
+      become: false
+      ansible.builtin.command: "podman logout bastion.lab.example.com:8443"
+      changed_when: false
+      failed_when: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Teardown complete."
+          - "VMs, disks, and the ocp-airgap network are gone."
+          - "default NAT network left intact."
+          - "binaries removed: {{ remove_binaries }}   workdir removed: {{ remove_workdir }}"
+
+  handlers:
+    - name: update ca trust
+      ansible.builtin.command: update-ca-trust
+      changed_when: true

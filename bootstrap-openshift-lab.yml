@@ -1,0 +1,773 @@
+---
+# =============================================================================
+#  bootstrap-openshift-lab.yml
+#
+#  Stands up a fully disconnected OpenShift 4.x compact 3-node cluster in a
+#  KVM/libvirt home lab, end to end, on a single Fedora host.
+#
+#  It automates (and bakes in every fix found during the manual build):
+#    * KVM/libvirt + isolated "air-gap" network
+#    * A cloud-init bastion (Rocky 9) running mirror-registry (Quay), dnsmasq, chrony
+#    * Mirroring the OCP release into Quay with oc-mirror v2 (host -> Quay, m2m)
+#    * The version-matched openshift-install extracted FROM the mirror
+#    * Agent-based install of a compact 3-node baremetal cluster
+#    * (optional) an htpasswd 'developer' user
+#
+#  Baked-in fixes (each one bit us in the manual run):
+#    - virtio NICs so the node interface is enp1s0 (matches agent-config nmstate)
+#    - disk boot.order=1 / cdrom boot.order=2 so nodes boot the ISO while the disk
+#      is empty, then boot from disk after install -- no boot loop, no power-cycling
+#    - openshift-install EXTRACTED FROM THE MIRROR (version match; no manifest-unknown)
+#    - Quay CA taken from the LIVE endpoint (correct signer, no x509 errors)
+#    - dnsmasq listening on all interfaces + firewall 53 open (nodes can resolve)
+#    - chrony 'local stratum 10' + additionalNTPSources (NTP validation passes)
+#    - /etc/hosts entries so FQDNs resolve during Quay install and mirroring
+#
+#  PREREQUISITES (read these!):
+#    1. Fedora host with virtualization (Intel VT-x / AMD-V) and ~700 GB free disk.
+#    2. A Red Hat pull secret saved at {{ pull_secret_path }} (default ~/pull-secret.json).
+#       Get it from https://console.redhat.com/openshift/install/pull-secret
+#    3. Ansible + collections:
+#         sudo dnf install -y ansible-core
+#         ansible-galaxy collection install ansible.posix community.general
+#    4. Confirm the OCP z-stream you pin below actually exists:
+#         curl -s https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/ | grep 4.19
+#
+#  RUN:
+#    ansible-playbook bootstrap-openshift-lab.yml --ask-become-pass
+#
+#  TIME: ~60-90 min (mostly the ~30 GB mirror + the 40-60 min cluster install).
+# =============================================================================
+
+- name: "Host preparation (KVM, network, binaries, bastion)"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars: &common
+    # --- identity ---
+    cluster_name: compact
+    base_domain: lab.example.com
+    # --- air-gap network ---
+    airgap_net: ocp-airgap
+    airgap_cidr: "192.168.150.0/24"
+    airgap_netmask: "255.255.255.0"
+    airgap_gw: "192.168.150.1"
+    bastion_ip: "192.168.150.10"
+    api_vip: "192.168.150.100"
+    ingress_vip: "192.168.150.101"
+    master_ips: ["192.168.150.20", "192.168.150.21", "192.168.150.22"]
+    bastion_nat_mac: "52:54:00:00:14:10"
+    bastion_airgap_mac: "52:54:00:00:15:10"
+    master_macs: ["52:54:00:00:15:20", "52:54:00:00:15:21", "52:54:00:00:15:22"]
+    # --- versions / download sources ---
+    ocp_release: "4.19.9"          # <-- CONFIRM this exists before running
+    ocp_channel: "stable-4.19"
+    clients_base: "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp"
+    mirror_registry_url: "https://mirror.openshift.com/pub/cgw/mirror-registry/latest/mirror-registry-amd64.tar.gz"
+    bastion_image_url: "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2"
+    # --- registry creds ---
+    quay_user: admin
+    quay_password: "ChangeMe123!"  # <-- CHANGE ME
+    quay_host: "bastion.{{ base_domain }}"
+    quay_port: 8443
+    # --- resources ---
+    bastion_ram_mb: 12288
+    bastion_vcpus: 4
+    bastion_disk_gb: 200
+    master_ram_mb: 20480
+    master_vcpus: 8
+    master_disk_gb: 120
+    # --- paths ---
+    home_dir: "{{ lookup('env', 'HOME') }}"
+    workdir: "{{ lookup('env', 'HOME') }}/ocp-lab"
+    images_dir: /var/lib/libvirt/images
+    pull_secret_path: "{{ lookup('env', 'HOME') }}/pull-secret.json"
+    ssh_key: "{{ lookup('env', 'HOME') }}/.ssh/ocp"
+    # --- toggles ---
+    detach_bastion_nat: false      # true = remove bastion internet after build (air-gap fidelity)
+    create_dev_user: true
+    dev_user: developer
+    dev_password: "DevPassw0rd!"
+
+  tasks:
+    # ---- pre-flight ----
+    - name: Pre-flight | pull secret present
+      ansible.builtin.stat:
+        path: "{{ pull_secret_path }}"
+      register: ps
+      failed_when: not ps.stat.exists
+
+    - name: Pre-flight | CPU virtualization support
+      ansible.builtin.shell: "grep -Eqc '(vmx|svm)' /proc/cpuinfo"
+      changed_when: false
+
+    - name: Host | install virtualization + tooling
+      become: true
+      ansible.builtin.dnf:
+        name:
+          - "@virtualization"
+          - libvirt
+          - libvirt-daemon-kvm
+          - qemu-kvm
+          - virt-install
+          - libguestfs-tools
+          - genisoimage
+          - podman
+          - jq
+          - openssl
+          - tar
+          - httpd-tools
+        state: present
+
+    - name: Host | enable libvirtd
+      become: true
+      ansible.builtin.systemd:
+        name: libvirtd
+        enabled: true
+        state: started
+
+    - name: Host | working dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ workdir }}"
+        - "{{ workdir }}/bin"
+        - "{{ workdir }}/mirror"
+        - "{{ workdir }}/cluster"
+        - "{{ workdir }}/saved"
+
+    # ---- air-gap network (isolated: NO <forward> element) ----
+    - name: Network | define ocp-airgap
+      become: true
+      ansible.builtin.shell: |
+        cat > /tmp/{{ airgap_net }}.xml <<EOF
+        <network>
+          <name>{{ airgap_net }}</name>
+          <bridge name="virbr-ocp"/>
+          <ip address="{{ airgap_gw }}" netmask="{{ airgap_netmask }}"/>
+        </network>
+        EOF
+        virsh net-info {{ airgap_net }} >/dev/null 2>&1 || virsh net-define /tmp/{{ airgap_net }}.xml
+        virsh net-start {{ airgap_net }} 2>/dev/null || true
+        virsh net-autostart {{ airgap_net }}
+      register: net_def
+      changed_when: "'Network ' + airgap_net + ' defined' in net_def.stdout or net_def.stdout != ''"
+
+    - name: Network | ensure default NAT network is up
+      become: true
+      ansible.builtin.shell: "virsh net-start default 2>/dev/null; virsh net-autostart default 2>/dev/null; true"
+      changed_when: false
+
+    # ---- CLI binaries (oc, oc-mirror, mirror-registry) ----
+    - name: Binaries | download client tarballs
+      ansible.builtin.get_url:
+        url: "{{ item }}"
+        dest: "{{ workdir }}/bin/{{ item | basename }}"
+        mode: "0644"
+      loop:
+        - "{{ clients_base }}/stable/openshift-client-linux.tar.gz"
+        - "{{ clients_base }}/latest/oc-mirror.rhel9.tar.gz"
+        - "{{ mirror_registry_url }}"
+
+    - name: Binaries | extract oc / kubectl
+      ansible.builtin.unarchive:
+        src: "{{ workdir }}/bin/openshift-client-linux.tar.gz"
+        dest: "{{ workdir }}/bin"
+        remote_src: true
+
+    - name: Binaries | extract oc-mirror
+      ansible.builtin.unarchive:
+        src: "{{ workdir }}/bin/oc-mirror.rhel9.tar.gz"
+        dest: "{{ workdir }}/bin"
+        remote_src: true
+
+    - name: Binaries | extract mirror-registry bundle
+      ansible.builtin.unarchive:
+        src: "{{ workdir }}/bin/mirror-registry-amd64.tar.gz"
+        dest: "{{ workdir }}/bin"
+        remote_src: true
+
+    - name: Binaries | install oc / oc-mirror to /usr/local/bin
+      become: true
+      ansible.builtin.copy:
+        src: "{{ workdir }}/bin/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        mode: "0755"
+        remote_src: true
+      loop: [oc, kubectl, oc-mirror]
+
+    # ---- SSH key for the lab ----
+    - name: SSH | generate lab keypair
+      ansible.builtin.command: "ssh-keygen -t ed25519 -f {{ ssh_key }} -N ''"
+      args:
+        creates: "{{ ssh_key }}"
+
+    # ---- bastion cloud image + cloud-init seed ----
+    - name: Bastion | download Rocky cloud image
+      become: true
+      ansible.builtin.get_url:
+        url: "{{ bastion_image_url }}"
+        dest: "{{ images_dir }}/bastion-base.qcow2"
+        mode: "0644"
+
+    - name: Bastion | create resized working disk from cloud image
+      become: true
+      ansible.builtin.shell: |
+        test -f {{ images_dir }}/bastion.qcow2 && exit 0
+        cp {{ images_dir }}/bastion-base.qcow2 {{ images_dir }}/bastion.qcow2
+        qemu-img resize {{ images_dir }}/bastion.qcow2 {{ bastion_disk_gb }}G
+      args:
+        creates: "{{ images_dir }}/bastion.qcow2"
+
+    - name: Bastion | cloud-init user-data
+      become: true
+      ansible.builtin.copy:
+        dest: "{{ images_dir }}/user-data"
+        mode: "0644"
+        content: |
+          #cloud-config
+          hostname: bastion
+          fqdn: bastion.{{ base_domain }}
+          preserve_hostname: false
+          users:
+            - name: bastion
+              sudo: "ALL=(ALL) NOPASSWD:ALL"
+              shell: /bin/bash
+              lock_passwd: false
+              ssh_authorized_keys:
+                - "{{ lookup('file', ssh_key + '.pub') }}"
+          ssh_pwauth: false
+          growpart:
+            mode: auto
+            devices: ["/"]
+
+    - name: Bastion | cloud-init meta-data
+      become: true
+      ansible.builtin.copy:
+        dest: "{{ images_dir }}/meta-data"
+        mode: "0644"
+        content: |
+          instance-id: bastion01
+          local-hostname: bastion.{{ base_domain }}
+
+    - name: Bastion | cloud-init network-config (match by MAC)
+      become: true
+      ansible.builtin.copy:
+        dest: "{{ images_dir }}/network-config"
+        mode: "0644"
+        content: |
+          version: 2
+          ethernets:
+            nat0:
+              match: {macaddress: "{{ bastion_nat_mac }}"}
+              dhcp4: true
+            air0:
+              match: {macaddress: "{{ bastion_airgap_mac }}"}
+              dhcp4: false
+              addresses: ["{{ bastion_ip }}/24"]
+
+    - name: Bastion | build cloud-init seed ISO
+      become: true
+      ansible.builtin.shell: |
+        cd {{ images_dir }}
+        genisoimage -output seed.iso -volid cidata -joliet -rock \
+          user-data meta-data network-config
+      args:
+        creates: "{{ images_dir }}/seed.iso"
+
+    - name: Bastion | create VM (NAT + air-gap NICs, cloud-init)
+      become: true
+      ansible.builtin.shell: |
+        virsh dominfo bastion >/dev/null 2>&1 && exit 0
+        virt-install --name bastion \
+          --ram {{ bastion_ram_mb }} --vcpus {{ bastion_vcpus }} \
+          --disk path={{ images_dir }}/bastion.qcow2,device=disk,bus=virtio \
+          --disk path={{ images_dir }}/seed.iso,device=cdrom \
+          --network network=default,mac={{ bastion_nat_mac }},model=virtio \
+          --network network={{ airgap_net }},mac={{ bastion_airgap_mac }},model=virtio \
+          --osinfo detect=on,require=off \
+          --import --noautoconsole
+      args:
+        creates: "/var/run/libvirt/qemu/bastion.pid"
+      register: bastion_create
+
+    - name: Bastion | wait for SSH
+      ansible.builtin.wait_for:
+        host: "{{ bastion_ip }}"
+        port: 22
+        delay: 20
+        timeout: 300
+
+    - name: Bastion | register in inventory
+      ansible.builtin.add_host:
+        name: bastion
+        ansible_host: "{{ bastion_ip }}"
+        ansible_user: bastion
+        ansible_ssh_private_key_file: "{{ ssh_key }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        groups: bastion
+
+    - name: Host | add bastion to /etc/hosts (for Quay push + mirroring)
+      become: true
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "bastion.{{ base_domain }}"
+        line: "{{ bastion_ip }} bastion.{{ base_domain }} bastion"
+
+
+# =============================================================================
+#  PLAY 2 — Configure the bastion (DNS, NTP, firewall, Quay registry)
+# =============================================================================
+- name: "Configure bastion services"
+  hosts: bastion
+  gather_facts: true
+  become: true
+  vars: *common
+
+  tasks:
+    - name: Bastion | wait for cloud-init to finish
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    - name: Bastion | /etc/hosts self + cluster names
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        block: |
+          {{ bastion_ip }} bastion.{{ base_domain }} bastion
+          {{ api_vip }} api.{{ cluster_name }}.{{ base_domain }}
+
+    - name: Bastion | install packages
+      ansible.builtin.dnf:
+        name: [podman, dnsmasq, chrony, nmstate, openssl, jq]
+        state: present
+
+    - name: Bastion | disable systemd-resolved (frees :53 for dnsmasq)
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        enabled: false
+        state: stopped
+      failed_when: false
+
+    - name: Bastion | dnsmasq config (listens on all interfaces)
+      ansible.builtin.copy:
+        dest: /etc/dnsmasq.d/ocp.conf
+        mode: "0644"
+        content: |
+          domain-needed
+          bogus-priv
+          no-resolv
+          local=/{{ base_domain }}/
+          host-record=bastion.{{ base_domain }},{{ bastion_ip }}
+          address=/api.{{ cluster_name }}.{{ base_domain }}/{{ api_vip }}
+          address=/api-int.{{ cluster_name }}.{{ base_domain }}/{{ api_vip }}
+          address=/.apps.{{ cluster_name }}.{{ base_domain }}/{{ ingress_vip }}
+          {% for i in range(3) %}
+          host-record=master{{ i }}.{{ cluster_name }}.{{ base_domain }},{{ master_ips[i] }}
+          {% endfor %}
+      notify: restart dnsmasq
+
+    - name: Bastion | enable dnsmasq
+      ansible.builtin.systemd:
+        name: dnsmasq
+        enabled: true
+        state: started
+
+    - name: Bastion | chrony as an authoritative stratum-10 source
+      ansible.builtin.blockinfile:
+        path: /etc/chrony.conf
+        block: |
+          # serve time to the air-gapped cluster even with no upstream
+          allow {{ airgap_cidr }}
+          local stratum 10
+      notify: restart chronyd
+
+    - name: Bastion | enable chronyd
+      ansible.builtin.systemd:
+        name: chronyd
+        enabled: true
+        state: started
+
+    - name: Bastion | open firewall (DNS, NTP, Quay)
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - firewall-cmd --add-service=dns --permanent
+        - firewall-cmd --add-service=ntp --permanent
+        - firewall-cmd --add-port=8443/tcp --permanent
+        - firewall-cmd --reload
+      changed_when: true
+      failed_when: false
+
+    # ---- mirror-registry (Quay) ----
+    - name: Bastion | copy mirror-registry bundle from host
+      ansible.builtin.copy:
+        src: "{{ workdir }}/bin/{{ item }}"
+        dest: "/home/bastion/{{ item }}"
+        mode: "0755"
+        owner: bastion
+        group: bastion
+      loop:
+        - mirror-registry
+        - image-archive.tar
+        - execution-environment.tar
+      failed_when: false
+
+    - name: Bastion | copy sqlite bundle if present
+      ansible.builtin.copy:
+        src: "{{ workdir }}/bin/sqlite3.tar"
+        dest: /home/bastion/sqlite3.tar
+        mode: "0644"
+        owner: bastion
+        group: bastion
+      failed_when: false
+
+    - name: Bastion | install Quay (idempotent-ish)
+      become: true
+      become_user: bastion
+      ansible.builtin.shell: |
+        cd /home/bastion
+        test -f /home/bastion/quay-install/quay-rootCA/rootCA.pem && exit 0
+        ./mirror-registry install \
+          --quayHostname bastion.{{ base_domain }} \
+          --initUser {{ quay_user }} --initPassword '{{ quay_password }}'
+      args:
+        creates: /home/bastion/quay-install/quay-rootCA/rootCA.pem
+      register: quay_install
+      timeout: 1200
+
+  handlers:
+    - name: restart dnsmasq
+      ansible.builtin.systemd: {name: dnsmasq, state: restarted}
+    - name: restart chronyd
+      ansible.builtin.systemd: {name: chronyd, state: restarted}
+
+
+# =============================================================================
+#  PLAY 3 — Mirror content, build the agent ISO, install the cluster (host)
+# =============================================================================
+- name: "Mirror content and install the cluster"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars: *common
+
+  tasks:
+    # ---- trust Quay CA taken from the LIVE endpoint (the correct signer) ----
+    - name: Mirror | extract Quay CA from the live registry
+      ansible.builtin.shell: |
+        openssl s_client -connect bastion.{{ base_domain }}:{{ quay_port }} -showcerts </dev/null 2>/dev/null \
+          | awk '/BEGIN CERT/{c++} c==2,/END CERT/' > {{ workdir }}/quay-ca.pem
+        test -s {{ workdir }}/quay-ca.pem
+      register: ca_extract
+      retries: 10
+      delay: 15
+      until: ca_extract.rc == 0
+
+    - name: Mirror | trust Quay CA on the host
+      become: true
+      ansible.builtin.copy:
+        src: "{{ workdir }}/quay-ca.pem"
+        dest: /etc/pki/ca-trust/source/anchors/quay-bastion.pem
+        mode: "0644"
+        remote_src: true
+      notify: update ca trust
+
+    - name: Mirror | flush handlers (update trust now)
+      ansible.builtin.meta: flush_handlers
+
+    # ---- auth.json: pull secret + Quay login ----
+    - name: Mirror | seed auth.json from pull secret
+      ansible.builtin.copy:
+        src: "{{ pull_secret_path }}"
+        dest: "{{ workdir }}/auth.json"
+        mode: "0600"
+        remote_src: true
+
+    - name: Mirror | podman login to Quay (merges into auth.json)
+      ansible.builtin.command: >
+        podman login bastion.{{ base_domain }}:{{ quay_port }}
+        -u {{ quay_user }} -p {{ quay_password }}
+        --authfile {{ workdir }}/auth.json
+      changed_when: false
+
+    # ---- image-set config + IDMS ----
+    - name: Mirror | write ImageSetConfiguration
+      ansible.builtin.copy:
+        dest: "{{ workdir }}/imageset-config.yaml"
+        mode: "0644"
+        content: |
+          kind: ImageSetConfiguration
+          apiVersion: mirror.openshift.io/v2alpha1
+          mirror:
+            platform:
+              channels:
+                - name: {{ ocp_channel }}
+                  minVersion: {{ ocp_release }}
+                  maxVersion: {{ ocp_release }}
+                  type: ocp
+              graph: true
+
+    - name: Mirror | write IDMS (for release extract + install-config)
+      ansible.builtin.copy:
+        dest: "{{ workdir }}/idms.yaml"
+        mode: "0644"
+        content: |
+          apiVersion: config.openshift.io/v1
+          kind: ImageDigestMirrorSet
+          metadata:
+            name: mirror
+          spec:
+            imageDigestMirrors:
+              - mirrors:
+                  - bastion.{{ base_domain }}:{{ quay_port }}/openshift/release-images
+                source: quay.io/openshift-release-dev/ocp-release
+              - mirrors:
+                  - bastion.{{ base_domain }}:{{ quay_port }}/openshift/release
+                source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+
+    - name: Mirror | run oc-mirror (host -> Quay, m2m)  [LONG ~30GB]
+      ansible.builtin.command: >
+        oc-mirror -c {{ workdir }}/imageset-config.yaml
+        --workspace file://{{ workdir }}/mirror
+        docker://bastion.{{ base_domain }}:{{ quay_port }} --v2
+      environment:
+        REGISTRY_AUTH_FILE: "{{ workdir }}/auth.json"
+      register: ocmirror
+      changed_when: true
+      timeout: 3600
+
+    # ---- version-matched installer, extracted FROM the mirror ----
+    - name: Installer | extract openshift-install from the mirror
+      ansible.builtin.command: >
+        oc adm release extract --command=openshift-install
+        --from=bastion.{{ base_domain }}:{{ quay_port }}/openshift/release-images:{{ ocp_release }}-x86_64
+        --idms-file={{ workdir }}/idms.yaml
+        --to={{ workdir }}/bin --insecure=true -a {{ workdir }}/auth.json
+      changed_when: true
+
+    - name: Installer | install openshift-install to /usr/local/bin
+      become: true
+      ansible.builtin.copy:
+        src: "{{ workdir }}/bin/openshift-install"
+        dest: /usr/local/bin/openshift-install
+        mode: "0755"
+        remote_src: true
+
+    # ---- mirror-only pull secret + install/agent configs ----
+    - name: Config | mirror-only pull secret
+      ansible.builtin.copy:
+        dest: "{{ workdir }}/pull-secret-mirror.json"
+        mode: "0600"
+        content: >
+          {"auths":{"bastion.{{ base_domain }}:{{ quay_port }}":
+          {"auth":"{{ (quay_user + ':' + quay_password) | b64encode }}",
+          "email":"lab@example.com"}}}
+
+    - name: Config | write install-config.yaml
+      ansible.builtin.copy:
+        dest: "{{ workdir }}/cluster/install-config.yaml"
+        mode: "0644"
+        content: |
+          apiVersion: v1
+          baseDomain: {{ base_domain }}
+          metadata:
+            name: {{ cluster_name }}
+          controlPlane:
+            name: master
+            replicas: 3
+            hyperthreading: Enabled
+          compute:
+            - name: worker
+              replicas: 0
+          networking:
+            networkType: OVNKubernetes
+            clusterNetwork:
+              - cidr: 10.128.0.0/14
+                hostPrefix: 23
+            serviceNetwork:
+              - 172.30.0.0/16
+            machineNetwork:
+              - cidr: {{ airgap_cidr }}
+          platform:
+            baremetal:
+              apiVIPs:
+                - {{ api_vip }}
+              ingressVIPs:
+                - {{ ingress_vip }}
+          imageDigestSources:
+            - mirrors:
+                - bastion.{{ base_domain }}:{{ quay_port }}/openshift/release-images
+              source: quay.io/openshift-release-dev/ocp-release
+            - mirrors:
+                - bastion.{{ base_domain }}:{{ quay_port }}/openshift/release
+              source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+          pullSecret: '{{ lookup('file', workdir + '/pull-secret-mirror.json') }}'
+          sshKey: '{{ lookup('file', ssh_key + '.pub') }}'
+          additionalTrustBundle: |
+          {{ lookup('file', workdir + '/quay-ca.pem') | indent(2, true) }}
+
+    - name: Config | write agent-config.yaml (virtio -> enp1s0, NTP -> bastion)
+      ansible.builtin.copy:
+        dest: "{{ workdir }}/cluster/agent-config.yaml"
+        mode: "0644"
+        content: |
+          apiVersion: v1alpha1
+          kind: AgentConfig
+          metadata:
+            name: {{ cluster_name }}
+          rendezvousIP: {{ master_ips[0] }}
+          additionalNTPSources:
+            - {{ bastion_ip }}
+          hosts:
+          {% for i in range(3) %}
+            - hostname: master{{ i }}.{{ cluster_name }}.{{ base_domain }}
+              role: master
+              interfaces:
+                - name: enp1s0
+                  macAddress: {{ master_macs[i] }}
+              networkConfig:
+                interfaces:
+                  - name: enp1s0
+                    type: ethernet
+                    state: up
+                    ipv4:
+                      enabled: true
+                      address:
+                        - ip: {{ master_ips[i] }}
+                          prefix-length: 24
+                dns-resolver:
+                  config:
+                    server: [{{ bastion_ip }}]
+                routes:
+                  config:
+                    - destination: 0.0.0.0/0
+                      next-hop-address: {{ airgap_gw }}
+                      next-hop-interface: enp1s0
+          {% endfor %}
+
+    - name: Config | keep pristine copies (installer consumes the originals)
+      ansible.builtin.copy:
+        src: "{{ workdir }}/cluster/{{ item }}"
+        dest: "{{ workdir }}/saved/{{ item }}"
+        mode: "0644"
+        remote_src: true
+      loop: [install-config.yaml, agent-config.yaml]
+
+    # ---- agent ISO ----
+    - name: ISO | generate agent image
+      ansible.builtin.command: "openshift-install agent create image --dir {{ workdir }}/cluster"
+      changed_when: true
+
+    - name: ISO | place where libvirt can read it
+      become: true
+      ansible.builtin.copy:
+        src: "{{ workdir }}/cluster/agent.x86_64.iso"
+        dest: "{{ images_dir }}/agent.iso"
+        mode: "0644"
+        remote_src: true
+
+    - name: ISO | fix SELinux labels on images dir
+      become: true
+      ansible.builtin.command: "restorecon -RF {{ images_dir }}"
+      changed_when: false
+      failed_when: false
+
+    # ---- node VMs: virtio NIC, empty disk boot.order=1, ISO cdrom boot.order=2 ----
+    - name: Nodes | pre-create empty master disks
+      become: true
+      ansible.builtin.command: "qemu-img create -f qcow2 {{ images_dir }}/master{{ item }}.qcow2 {{ master_disk_gb }}G"
+      args:
+        creates: "{{ images_dir }}/master{{ item }}.qcow2"
+      loop: [0, 1, 2]
+
+    - name: Nodes | define + start master VMs
+      become: true
+      ansible.builtin.shell: |
+        virsh dominfo master{{ item }} >/dev/null 2>&1 && exit 0
+        virt-install --name master{{ item }} \
+          --ram {{ master_ram_mb }} --vcpus {{ master_vcpus }} \
+          --disk path={{ images_dir }}/master{{ item }}.qcow2,device=disk,bus=virtio,boot.order=1 \
+          --disk path={{ images_dir }}/agent.iso,device=cdrom,boot.order=2 \
+          --network network={{ airgap_net }},mac={{ master_macs[item] }},model=virtio \
+          --osinfo detect=on,require=off \
+          --import --noautoconsole
+      args:
+        creates: "/var/run/libvirt/qemu/master{{ item }}.pid"
+      loop: [0, 1, 2]
+
+    # ---- wait for the install ----
+    - name: Install | wait for bootstrap-complete  [LONG]
+      ansible.builtin.command: >
+        openshift-install --dir {{ workdir }}/cluster
+        agent wait-for bootstrap-complete --log-level=info
+      changed_when: false
+      timeout: 3600
+
+    - name: Install | wait for install-complete  [LONG]
+      ansible.builtin.command: >
+        openshift-install --dir {{ workdir }}/cluster
+        agent wait-for install-complete --log-level=info
+      changed_when: false
+      timeout: 3600
+
+    # ---- optional: developer user ----
+    - name: Post | create htpasswd developer user
+      when: create_dev_user | bool
+      environment:
+        KUBECONFIG: "{{ workdir }}/cluster/auth/kubeconfig"
+      block:
+        - name: Post | build htpasswd file
+          ansible.builtin.command: "htpasswd -c -B -b {{ workdir }}/users.htpasswd {{ dev_user }} {{ dev_password }}"
+          changed_when: true
+
+        - name: Post | create htpass-secret
+          ansible.builtin.command: >
+            oc create secret generic htpass-secret
+            --from-file=htpasswd={{ workdir }}/users.htpasswd -n openshift-config
+          register: secret_create
+          changed_when: "'created' in secret_create.stdout"
+          failed_when: secret_create.rc != 0 and 'AlreadyExists' not in secret_create.stderr
+
+        - name: Post | wire htpasswd IdP into OAuth
+          ansible.builtin.shell: |
+            cat <<'EOF' | oc apply -f -
+            apiVersion: config.openshift.io/v1
+            kind: OAuth
+            metadata:
+              name: cluster
+            spec:
+              identityProviders:
+                - name: htpasswd_provider
+                  mappingMethod: claim
+                  type: HTPasswd
+                  htpasswd:
+                    fileData:
+                      name: htpass-secret
+            EOF
+          changed_when: true
+
+    # ---- optional: cut the bastion's internet for air-gap fidelity ----
+    - name: Post | detach bastion NAT NIC
+      when: detach_bastion_nat | bool
+      become: true
+      ansible.builtin.command: "virsh detach-interface bastion --type network --mac {{ bastion_nat_mac }} --live --config"
+      changed_when: true
+      failed_when: false
+
+    - name: Post | summary
+      ansible.builtin.debug:
+        msg:
+          - "Cluster install complete."
+          - "KUBECONFIG:  export KUBECONFIG={{ workdir }}/cluster/auth/kubeconfig"
+          - "Console:     https://console-openshift-console.apps.{{ cluster_name }}.{{ base_domain }}"
+          - "kubeadmin pw: see {{ workdir }}/cluster/auth/kubeadmin-password"
+          - "developer:   {{ dev_user }} / {{ dev_password }}  (if create_dev_user=true)"
+          - "Quay:        https://bastion.{{ base_domain }}:{{ quay_port }}  ({{ quay_user }}/{{ quay_password }})"
+
+  handlers:
+    - name: update ca trust
+      become: true
+      ansible.builtin.command: update-ca-trust
+      changed_when: true
