@@ -44,6 +44,11 @@
   connection: local
   gather_facts: true
   vars: &common
+    # --- Ansible plumbing ---
+    # Force temp files onto the same filesystem as /etc so atomic file writes
+    # (lineinfile/blockinfile/copy) don't fail with a cross-device rename when
+    # /home and / are separate mounts.
+    ansible_remote_tmp: /tmp/.ansible-tmp
     # --- identity ---
     cluster_name: compact
     base_domain: lab.example.com
@@ -200,7 +205,7 @@
 
     # ---- SSH key for the lab ----
     - name: SSH | generate lab keypair
-      ansible.builtin.command: "ssh-keygen -t ed25519 -f {{ ssh_key }} -N ''"
+      ansible.builtin.command: "ssh-keygen -t ed25519 -f {{ ssh_key }} -N '' -C ocp-lab"
       args:
         creates: "{{ ssh_key }}"
 
@@ -307,7 +312,7 @@
         ansible_user: bastion
         ansible_ssh_private_key_file: "{{ ssh_key }}"
         ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-        groups: bastion
+        groups: bastion_hosts
 
     - name: Host | add bastion to /etc/hosts (for Quay push + mirroring)
       become: true
@@ -315,13 +320,14 @@
         path: /etc/hosts
         regexp: "bastion.{{ base_domain }}"
         line: "{{ bastion_ip }} bastion.{{ base_domain }} bastion"
+        unsafe_writes: true
 
 
 # =============================================================================
 #  PLAY 2 — Configure the bastion (DNS, NTP, firewall, Quay registry)
 # =============================================================================
 - name: "Configure bastion services"
-  hosts: bastion
+  hosts: bastion_hosts
   gather_facts: true
   become: true
   vars: *common
@@ -338,6 +344,7 @@
         block: |
           {{ bastion_ip }} bastion.{{ base_domain }} bastion
           {{ api_vip }} api.{{ cluster_name }}.{{ base_domain }}
+        unsafe_writes: true
 
     - name: Bastion | install packages
       ansible.builtin.dnf:
@@ -531,9 +538,8 @@
       ansible.builtin.command: >
         oc-mirror -c {{ workdir }}/imageset-config.yaml
         --workspace file://{{ workdir }}/mirror
+        --authfile {{ workdir }}/auth.json
         docker://bastion.{{ base_domain }}:{{ quay_port }} --v2
-      environment:
-        REGISTRY_AUTH_FILE: "{{ workdir }}/auth.json"
       register: ocmirror
       changed_when: true
       timeout: 3600
