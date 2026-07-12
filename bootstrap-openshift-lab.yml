@@ -356,9 +356,43 @@
         name: systemd-resolved
         enabled: false
         state: stopped
+        masked: true
       failed_when: false
 
-    - name: Bastion | dnsmasq config (listens on all interfaces)
+    - name: Bastion | ensure dnsmasq drop-in dir exists
+      ansible.builtin.file:
+        path: /etc/systemd/system/dnsmasq.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Bastion | order dnsmasq after network-online (enclave IP must be up)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/dnsmasq.service.d/wait-network.conf
+        mode: "0644"
+        content: |
+          [Unit]
+          After=network-online.target
+          Wants=network-online.target
+      notify: restart dnsmasq
+
+    - name: Bastion | reload systemd for the drop-in
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Bastion | neutralise conflicting directives in base dnsmasq.conf
+      ansible.builtin.replace:
+        path: /etc/dnsmasq.conf
+        regexp: '^\s*(bind-interfaces|bind-dynamic|listen-address=.*|interface=(?!$).*)\s*$'
+        replace: '# \g<1>  # superseded by /etc/dnsmasq.d/ocp.conf'
+      failed_when: false
+
+    - name: Bastion | remove any stray dnsmasq drop-ins (ocp.conf is authoritative)
+      ansible.builtin.shell: |
+        find /etc/dnsmasq.d -maxdepth 1 -type f -name '*.conf' ! -name 'ocp.conf' -delete 2>/dev/null
+        true
+      changed_when: false
+
+    - name: Bastion | dnsmasq config (bind to enclave IP + loopback)
       ansible.builtin.copy:
         dest: /etc/dnsmasq.d/ocp.conf
         mode: "0644"
@@ -367,6 +401,8 @@
           bogus-priv
           no-resolv
           local=/{{ base_domain }}/
+          listen-address=127.0.0.1,{{ bastion_ip }}
+          bind-dynamic
           host-record=bastion.{{ base_domain }},{{ bastion_ip }}
           address=/api.{{ cluster_name }}.{{ base_domain }}/{{ api_vip }}
           address=/api-int.{{ cluster_name }}.{{ base_domain }}/{{ api_vip }}
@@ -376,11 +412,15 @@
           {% endfor %}
       notify: restart dnsmasq
 
-    - name: Bastion | enable dnsmasq
+    - name: Bastion | validate dnsmasq configuration
+      ansible.builtin.command: dnsmasq --test
+      changed_when: false
+
+    - name: Bastion | enable + (re)start dnsmasq
       ansible.builtin.systemd:
         name: dnsmasq
         enabled: true
-        state: started
+        state: restarted
 
     - name: Bastion | chrony as an authoritative stratum-10 source
       ansible.builtin.blockinfile:
@@ -464,9 +504,20 @@
     # ---- trust Quay CA taken from the LIVE endpoint (the correct signer) ----
     - name: Mirror | extract Quay CA from the live registry
       ansible.builtin.shell: |
+        set -o pipefail
         openssl s_client -connect bastion.{{ base_domain }}:{{ quay_port }} -showcerts </dev/null 2>/dev/null \
-          | awk '/BEGIN CERT/{c++} c==2,/END CERT/' > {{ workdir }}/quay-ca.pem
+          | awk 'BEGIN{c=0}
+                 /-----BEGIN CERTIFICATE-----/{c++}
+                 c==2{print}
+                 /-----END CERTIFICATE-----/{if(c==2) exit}' \
+          | openssl x509 -out {{ workdir }}/quay-ca.pem
         test -s {{ workdir }}/quay-ca.pem
+        # sanity: must be a self-signed CA (subject == issuer)
+        s=$(openssl x509 -in {{ workdir }}/quay-ca.pem -noout -subject)
+        i=$(openssl x509 -in {{ workdir }}/quay-ca.pem -noout -issuer)
+        test "${s#subject}" = "${i#issuer}"
+      args:
+        executable: /bin/bash
       register: ca_extract
       retries: 10
       delay: 15
@@ -542,7 +593,12 @@
         docker://bastion.{{ base_domain }}:{{ quay_port }} --v2
       register: ocmirror
       changed_when: true
-      timeout: 3600
+      timeout: 5400
+      # transient blob-write timeouts ("context deadline exceeded") are common on
+      # slow disks/links; oc-mirror v2 caches pushed blobs, so each retry resumes.
+      retries: 4
+      delay: 20
+      until: ocmirror.rc == 0
 
     # ---- version-matched installer, extracted FROM the mirror ----
     - name: Installer | extract openshift-install from the mirror
